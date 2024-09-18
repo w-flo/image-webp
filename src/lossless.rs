@@ -176,10 +176,7 @@ impl<R: BufRead> LosslessDecoder<R> {
         data: &mut [u8],
     ) -> Result<(), DecodingError> {
         let color_cache_bits = self.read_color_cache()?;
-        let color_cache = color_cache_bits.map(|bits| ColorCache {
-            color_cache_bits: bits,
-            color_cache: vec![[0; 4]; 1 << bits],
-        });
+        let color_cache = color_cache_bits.map(ColorCache::new);
 
         let huffman_info = self.read_huffman_codes(is_argb_img, xsize, ysize, color_cache)?;
         self.decode_image_data(xsize, ysize, huffman_info, data)
@@ -679,24 +676,52 @@ impl HuffmanInfo {
 }
 
 #[derive(Debug, Clone)]
-struct ColorCache {
-    color_cache_bits: u8,
+pub(crate) struct ColorCache {
+    pub(crate) color_cache_bits: u8,
     color_cache: Vec<[u8; 4]>,
 }
 
 impl ColorCache {
+    pub(crate) fn new(bits: u8) -> Self {
+        Self {
+            color_cache_bits: bits,
+            color_cache: vec![[0; 4]; 1 << bits],
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.color_cache.clear();
+        self.color_cache.resize(1 << self.color_cache_bits, [0; 4]);
+    }
+
     #[inline(always)]
-    fn insert(&mut self, color: [u8; 4]) {
+    fn hash(&self, color: [u8; 4]) -> usize {
         let [r, g, b, a] = color;
         let color_u32 =
             (u32::from(r) << 16) | (u32::from(g) << 8) | (u32::from(b)) | (u32::from(a) << 24);
-        let index = (0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits);
-        self.color_cache[index as usize] = color;
+        ((0x1e35a7bdu32.wrapping_mul(color_u32)) >> (32 - self.color_cache_bits)) as usize
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert(&mut self, color: [u8; 4]) {
+        let index = self.hash(color);
+        self.color_cache[index] = color;
     }
 
     #[inline(always)]
     fn lookup(&self, index: usize) -> [u8; 4] {
         self.color_cache[index]
+    }
+
+    /// If the given color is currently in the cache, returns its cache index
+    #[inline(always)]
+    pub(crate) fn check(&self, color: [u8; 4]) -> Option<usize> {
+        let index = self.hash(color);
+        if self.color_cache[index] == color {
+            Some(index)
+        } else {
+            None
+        }
     }
 }
 

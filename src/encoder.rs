@@ -5,6 +5,8 @@ use std::slice::ChunksExact;
 
 use quick_error::quick_error;
 
+use crate::lossless::ColorCache;
+
 /// Color type of the image.
 ///
 /// Note that the WebP format doesn't have a concept of color type. All images are encoded as RGBA
@@ -267,7 +269,7 @@ fn write_huffman_tree<W: Write>(
             w.write_bits(3, 3)?; // max_symbol_nbits / 2 - 2
             w.write_bits(254, 8)?; // max_symbol - 2
         }
-        280 => w.write_bits(0, 1)?,
+        280.. => w.write_bits(0, 1)?,
         _ => unreachable!(),
     }
 
@@ -293,11 +295,55 @@ fn length_to_symbol(len: u16) -> (u16, u8) {
     (symbol, extra_bits as u8)
 }
 
+/// Returns true if there was a cache hit, false if the cache had to be updated
+#[inline(always)]
+fn count_cache_hit(
+    pixel: &[u8],
+    frequencies1: &mut [u32],
+    color_cache: &mut Option<ColorCache>,
+) -> bool {
+    if let Some(cache) = color_cache.as_mut() {
+        let color: [u8; 4] = pixel.try_into().unwrap();
+
+        if let Some(idx) = cache.check(color) {
+            frequencies1[280 + idx] += 1;
+            return true;
+        } else {
+            cache.insert(color);
+        }
+    }
+
+    false
+}
+
+/// Returns true if there was a cache hit, false if the cache had to be updated
+#[inline(always)]
+fn write_cache_hit<W: Write>(
+    w: &mut BitWriter<W>,
+    pixel: &[u8],
+    codes1: &[u16],
+    lengths1: &[u8],
+    color_cache: &mut Option<ColorCache>,
+) -> io::Result<bool> {
+    if let Some(cache) = color_cache.as_mut() {
+        let color: [u8; 4] = pixel.try_into().unwrap();
+
+        if let Some(idx) = cache.check(color) {
+            w.write_bits(codes1[280 + idx] as u64, lengths1[280 + idx])?;
+            return Ok(true);
+        } else {
+            cache.insert(color);
+        }
+    }
+
+    Ok(false)
+}
+
 #[inline(always)]
 fn count_run(
     pixel: &[u8],
     it: &mut std::iter::Peekable<ChunksExact<u8>>,
-    frequencies1: &mut [u32; 280],
+    frequencies1: &mut [u32],
 ) {
     let mut run_length = 0;
     while run_length < 4096 && it.peek() == Some(&pixel) {
@@ -320,8 +366,8 @@ fn write_run<W: Write>(
     w: &mut BitWriter<W>,
     pixel: &[u8],
     it: &mut std::iter::Peekable<ChunksExact<u8>>,
-    codes1: &[u16; 280],
-    lengths1: &[u8; 280],
+    codes1: &[u16],
+    lengths1: &[u8],
 ) -> io::Result<()> {
     let mut run_length = 0;
     while run_length < 4096 && it.peek() == Some(&pixel) {
@@ -355,13 +401,29 @@ fn write_run<W: Write>(
 pub struct EncoderParams {
     /// Use a predictor transform. Enabled by default.
     pub use_predictor_transform: bool,
+    color_cache_bits: Option<u8>,
 }
 
 impl Default for EncoderParams {
     fn default() -> Self {
         Self {
             use_predictor_transform: true,
+            color_cache_bits: None,
         }
+    }
+}
+
+impl EncoderParams {
+    /// Enable the color cache with size `2 ^ bits`. Valid range is 1..=11 bits.
+    /// The cache is off by default.
+    pub fn enable_color_cache(&mut self, bits: u8) {
+        assert!(bits >= 1 && bits <= 11);
+        self.color_cache_bits = Some(bits);
+    }
+
+    /// Disable the color cache. This is the default.
+    pub fn disable_color_cache(&mut self) {
+        self.color_cache_bits = None;
     }
 }
 
@@ -424,7 +486,17 @@ fn encode_frame<W: Write>(
     w.write_bits(0x0, 1)?;
 
     // color cache
-    w.write_bits(0x0, 1)?;
+    let mut color_cache = params.color_cache_bits.map(ColorCache::new);
+
+    let mut num_green_freqs = 280;
+    if let Some(cache) = &color_cache {
+        num_green_freqs += 1 << cache.color_cache_bits;
+
+        w.write_bits(0x1, 1)?;
+        w.write_bits(cache.color_cache_bits.into(), 4)?;
+    } else {
+        w.write_bits(0x0, 1)?;
+    }
 
     // meta-huffman codes
     w.write_bits(0x0, 1)?;
@@ -467,7 +539,7 @@ fn encode_frame<W: Write>(
 
     // compute frequencies
     let mut frequencies0 = [0u32; 256];
-    let mut frequencies1 = [0u32; 280];
+    let mut frequencies1 = vec![0u32; num_green_freqs];
     let mut frequencies2 = [0u32; 256];
     let mut frequencies3 = [0u32; 256];
     let mut it = pixels.chunks_exact(4).peekable();
@@ -477,7 +549,10 @@ fn encode_frame<W: Write>(
             frequencies2[0] = 1;
             frequencies3[0] = 1;
             while let Some(pixel) = it.next() {
-                frequencies1[pixel[1] as usize] += 1;
+                if !count_cache_hit(pixel, &mut frequencies1, &mut color_cache) {
+                    frequencies1[pixel[1] as usize] += 1;
+                }
+
                 count_run(pixel, &mut it, &mut frequencies1);
             }
         }
@@ -485,26 +560,35 @@ fn encode_frame<W: Write>(
             frequencies0[0] = 1;
             frequencies2[0] = 1;
             while let Some(pixel) = it.next() {
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies3[pixel[3] as usize] += 1;
+                if !count_cache_hit(pixel, &mut frequencies1, &mut color_cache) {
+                    frequencies1[pixel[1] as usize] += 1;
+                    frequencies3[pixel[3] as usize] += 1;
+                }
+
                 count_run(pixel, &mut it, &mut frequencies1);
             }
         }
         ColorType::Rgb8 => {
             frequencies3[0] = 1;
             while let Some(pixel) = it.next() {
-                frequencies0[pixel[0] as usize] += 1;
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies2[pixel[2] as usize] += 1;
+                if !count_cache_hit(pixel, &mut frequencies1, &mut color_cache) {
+                    frequencies0[pixel[0] as usize] += 1;
+                    frequencies1[pixel[1] as usize] += 1;
+                    frequencies2[pixel[2] as usize] += 1;
+                }
+
                 count_run(pixel, &mut it, &mut frequencies1);
             }
         }
         ColorType::Rgba8 => {
             while let Some(pixel) = it.next() {
-                frequencies0[pixel[0] as usize] += 1;
-                frequencies1[pixel[1] as usize] += 1;
-                frequencies2[pixel[2] as usize] += 1;
-                frequencies3[pixel[3] as usize] += 1;
+                if !count_cache_hit(pixel, &mut frequencies1, &mut color_cache) {
+                    frequencies0[pixel[0] as usize] += 1;
+                    frequencies1[pixel[1] as usize] += 1;
+                    frequencies2[pixel[2] as usize] += 1;
+                    frequencies3[pixel[3] as usize] += 1;
+                }
+
                 count_run(pixel, &mut it, &mut frequencies1);
             }
         }
@@ -512,11 +596,11 @@ fn encode_frame<W: Write>(
 
     // compute and write huffman codes
     let mut lengths0 = [0u8; 256];
-    let mut lengths1 = [0u8; 280];
+    let mut lengths1 = vec![0u8; num_green_freqs];
     let mut lengths2 = [0u8; 256];
     let mut lengths3 = [0u8; 256];
     let mut codes0 = [0u16; 256];
-    let mut codes1 = [0u16; 280];
+    let mut codes1 = vec![0u16; num_green_freqs];
     let mut codes2 = [0u16; 256];
     let mut codes3 = [0u16; 256];
     write_huffman_tree(w, &frequencies1, &mut lengths1, &mut codes1)?;
@@ -536,57 +620,73 @@ fn encode_frame<W: Write>(
     }
     write_single_entry_huffman_tree(w, 1)?;
 
+    if let Some(cache) = &mut color_cache {
+        cache.clear();
+    }
+
     // Write image data
     let mut it = pixels.chunks_exact(4).peekable();
     match color {
         ColorType::L8 => {
             while let Some(pixel) = it.next() {
-                w.write_bits(
-                    codes1[pixel[1] as usize] as u64,
-                    lengths1[pixel[1] as usize],
-                )?;
+                if !write_cache_hit(w, pixel, &codes1, &lengths1, &mut color_cache)? {
+                    w.write_bits(
+                        codes1[pixel[1] as usize] as u64,
+                        lengths1[pixel[1] as usize],
+                    )?;
+                }
+
                 write_run(w, pixel, &mut it, &codes1, &lengths1)?;
             }
         }
         ColorType::La8 => {
             while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len3 = lengths3[pixel[3] as usize];
+                if !write_cache_hit(w, pixel, &codes1, &lengths1, &mut color_cache)? {
+                    let len1 = lengths1[pixel[1] as usize];
+                    let len3 = lengths3[pixel[3] as usize];
 
-                let code =
-                    codes1[pixel[1] as usize] as u64 | (codes3[pixel[3] as usize] as u64) << len1;
+                    let code = codes1[pixel[1] as usize] as u64
+                        | (codes3[pixel[3] as usize] as u64) << len1;
 
-                w.write_bits(code, len1 + len3)?;
+                    w.write_bits(code, len1 + len3)?;
+                }
+
                 write_run(w, pixel, &mut it, &codes1, &lengths1)?;
             }
         }
         ColorType::Rgb8 => {
             while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len0 = lengths0[pixel[0] as usize];
-                let len2 = lengths2[pixel[2] as usize];
+                if !write_cache_hit(w, pixel, &codes1, &lengths1, &mut color_cache)? {
+                    let len1 = lengths1[pixel[1] as usize];
+                    let len0 = lengths0[pixel[0] as usize];
+                    let len2 = lengths2[pixel[2] as usize];
 
-                let code = codes1[pixel[1] as usize] as u64
-                    | (codes0[pixel[0] as usize] as u64) << len1
-                    | (codes2[pixel[2] as usize] as u64) << (len1 + len0);
+                    let code = codes1[pixel[1] as usize] as u64
+                        | (codes0[pixel[0] as usize] as u64) << len1
+                        | (codes2[pixel[2] as usize] as u64) << (len1 + len0);
 
-                w.write_bits(code, len1 + len0 + len2)?;
+                    w.write_bits(code, len1 + len0 + len2)?;
+                }
+
                 write_run(w, pixel, &mut it, &codes1, &lengths1)?;
             }
         }
         ColorType::Rgba8 => {
             while let Some(pixel) = it.next() {
-                let len1 = lengths1[pixel[1] as usize];
-                let len0 = lengths0[pixel[0] as usize];
-                let len2 = lengths2[pixel[2] as usize];
-                let len3 = lengths3[pixel[3] as usize];
+                if !write_cache_hit(w, pixel, &codes1, &lengths1, &mut color_cache)? {
+                    let len1 = lengths1[pixel[1] as usize];
+                    let len0 = lengths0[pixel[0] as usize];
+                    let len2 = lengths2[pixel[2] as usize];
+                    let len3 = lengths3[pixel[3] as usize];
 
-                let code = codes1[pixel[1] as usize] as u64
-                    | (codes0[pixel[0] as usize] as u64) << len1
-                    | (codes2[pixel[2] as usize] as u64) << (len1 + len0)
-                    | (codes3[pixel[3] as usize] as u64) << (len1 + len0 + len2);
+                    let code = codes1[pixel[1] as usize] as u64
+                        | (codes0[pixel[0] as usize] as u64) << len1
+                        | (codes2[pixel[2] as usize] as u64) << (len1 + len0)
+                        | (codes3[pixel[3] as usize] as u64) << (len1 + len0 + len2);
 
-                w.write_bits(code, len1 + len0 + len2 + len3)?;
+                    w.write_bits(code, len1 + len0 + len2 + len3)?;
+                }
+
                 write_run(w, pixel, &mut it, &codes1, &lengths1)?;
             }
         }
@@ -794,6 +894,13 @@ mod tests {
             use_predictor_transform: false,
             ..Default::default()
         });
+
+        for bits in 1..=11 {
+            roundtrip_libwebp_params(EncoderParams {
+                color_cache_bits: Some(bits),
+                ..Default::default()
+            });
+        }
     }
 
     fn roundtrip_libwebp_params(params: EncoderParams) {
